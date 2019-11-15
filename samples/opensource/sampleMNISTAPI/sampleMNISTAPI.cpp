@@ -161,6 +161,90 @@ bool SampleMNISTAPI::build()
     return true;
 }
 
+union Int8Config
+{
+    struct Layer {
+        bool scale_1_use_int8;
+        bool conv1_use_int8;
+        bool pool1_use_int8;
+        bool conv2_use_int8;
+        bool pool2_use_int8;
+        bool ip1_use_int8;
+        bool relu1_use_int8;
+        bool ip2_use_int8;
+        bool prob_use_int8;
+    } Layer;
+
+    struct Bools {
+        bool use_int8[9];
+    } Bools;
+};
+
+union Int8Config gINT8_CONFIG;
+
+void SetupAllLayerPrecision(INetworkDefinition* network, float scales) {
+    auto num_layers = network->getNbLayers();
+    for (int i = 0; i < num_layers; i++) {
+        auto layer = network->getLayer(i);
+        auto current_layer_use_int8 = gINT8_CONFIG.Bools.use_int8[i];
+        gLogInfo << layer->getName() << " is set to " << ((current_layer_use_int8)?"kINT8":"kFLOAT") << std::endl;
+
+        if (current_layer_use_int8) {
+            layer->setPrecision(DataType::kINT8);
+            auto input_tensor = layer->getInput(0);
+            input_tensor->setDynamicRange(-scales, scales);
+        }
+        else {
+            layer->setPrecision(DataType::kFLOAT);
+            layer->setOutputType(0, DataType::kFLOAT);
+        }
+
+        int next_layer = i + 1;
+        if (next_layer < num_layers) {
+            auto next_layer_use_int8 = gINT8_CONFIG.Bools.use_int8[next_layer];
+            if (next_layer_use_int8) {
+                layer->setOutputType(0, DataType::kINT8);
+            }
+            else {
+                layer->setOutputType(0, DataType::kFLOAT);
+            }
+        }
+    }
+}
+
+void SetupDebugName(INetworkDefinition* network) {
+
+    std::map<LayerType, std::string> ltype2str = {
+        {LayerType::kCONVOLUTION, "Conv"},
+        {LayerType::kFULLY_CONNECTED, "FC"},
+        {LayerType::kACTIVATION, "ReLU"},
+        {LayerType::kPOOLING, "Pool"},
+        {LayerType::kSCALE, "Scale"},
+        {LayerType::kSOFTMAX, "Softmax"}
+    };
+
+    auto num_layers = network->getNbLayers();
+    for (int i = 0; i < num_layers; i++) {
+        auto layer = network->getLayer(i);
+        auto ltype = layer->getType();
+        std::string layer_name = "Layer_" + std::to_string(i) + 
+            "_" + ltype2str.at(ltype);
+        layer->setName(layer_name.c_str());
+    }
+
+    for (int i = 0; i < num_layers; ++i) {
+        auto layer = network->getLayer(i);
+        std::string tensor_name = "Tensor_from_" + std::string(layer->getName());
+        if (i + 1 < num_layers) {
+            auto next_layer = network->getLayer(i + 1);
+            tensor_name += "_to_" + std::string(next_layer->getName());
+        }
+        auto output_tenor = layer->getOutput(0);
+        output_tenor->setName(tensor_name.c_str());
+    }
+}
+
+
 //!
 //! \brief Uses the API to create the MNIST Network
 //!
@@ -175,6 +259,7 @@ bool SampleMNISTAPI::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& build
     ITensor* data = network->addInput(
         mParams.inputTensorNames[0].c_str(), DataType::kFLOAT, Dims3{1, mParams.inputH, mParams.inputW});
     assert(data);
+    data->setType(DataType::kFLOAT);
 
     // Create scale layer with default power/shift and specified scale parameter.
     const float scaleParam = 0.0125f;
@@ -223,6 +308,8 @@ bool SampleMNISTAPI::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& build
     // Add softmax layer to determine the probability.
     ISoftMaxLayer* prob = network->addSoftMax(*ip2->getOutput(0));
     assert(prob);
+    SetupDebugName(network.get());
+    // over-write prob's name
     prob->getOutput(0)->setName(mParams.outputTensorNames[0].c_str());
     network->markOutput(*prob->getOutput(0));
 
@@ -236,7 +323,8 @@ bool SampleMNISTAPI::constructNetwork(SampleUniquePtr<nvinfer1::IBuilder>& build
     if (mParams.int8)
     {
         config->setFlag(BuilderFlag::kINT8);
-        samplesCommon::setAllTensorScales(network.get(), 64.0f, 64.0f);
+        config->setFlag(BuilderFlag::kSTRICT_TYPES);
+        SetupAllLayerPrecision(network.get(), 64.f);
     }
 
     samplesCommon::enableDLA(builder.get(), config.get(), mParams.dlaCore);
@@ -503,6 +591,27 @@ void printHelpInfo()
 
 int main(int argc, char** argv)
 {
+    for (int i = 0; i < 9; ++i) {
+        gINT8_CONFIG.Bools.use_int8[i] = false;
+    }
+
+    if (argc > 1) {
+        for (int i = 1; i < argc; ++i) {
+            if (strcmp(argv[i], "l") == 0) {
+                if (i + 1 >= argc) {
+                    gLogError << ("need argument for \"l\"") << std::endl;
+                    return 0;
+                }
+                int layer = std::atoi(argv[i + 1]);
+                if (layer < 0 || layer >=9) {
+                    gLogError << ("\"l\" argument must be 0~8") << std::endl;
+                    return 0;
+                }
+                gINT8_CONFIG.Bools.use_int8[layer] = true;
+            }
+        }
+    }
+
     samplesCommon::Args args;
     bool argsOK = samplesCommon::parseArgs(args, argc, argv);
     if (!argsOK)
