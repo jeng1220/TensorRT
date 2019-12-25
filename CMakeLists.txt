@@ -77,11 +77,38 @@ endif()
 
 set(CMAKE_CXX_FLAGS "-Wno-deprecated-declarations ${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss")
 
+if (DEFINED GPU_ARCHS)
+  message(STATUS "GPU_ARCHS defined as ${GPU_ARCHS}. Generating CUDA code for SM ${GPU_ARCHS}")
+  separate_arguments(GPU_ARCHS)
+else()
+  list(APPEND GPU_ARCHS
+      35
+      53
+      61
+      70
+      75
+    )
+  message(STATUS "GPU_ARCHS is not defined. Generating CUDA code for default SMs: ${GPU_ARCHS}")
+endif()
+set(BERT_GENCODES)
+# Generate SASS for each architecture
+foreach(arch ${GPU_ARCHS})
+    if (${arch} GREATER_EQUAL 70)
+        set(BERT_GENCODES "${BERT_GENCODES} -gencode arch=compute_${arch},code=sm_${arch}")
+    endif()
+    set(GENCODES "${GENCODES} -gencode arch=compute_${arch},code=sm_${arch}")
+endforeach()
+# Generate PTX for the last architecture in the list.
+list(GET GPU_ARCHS -1 LATEST_SM)
+set(GENCODES "${GENCODES} -gencode arch=compute_${LATEST_SM},code=compute_${LATEST_SM}")
+if (${LATEST_SM} GREATER_EQUAL 70)
+    set(BERT_GENCODES "${BERT_GENCODES} -gencode arch=compute_${LATEST_SM},code=compute_${LATEST_SM}")
+endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Wno-deprecated-declarations")
 
 ################################### DEPENDENCIES ##########################################
-set(DEFAULT_CUDA_VERSION 10.1)
-set(DEFAULT_CUDNN_VERSION 7.5)
+set(DEFAULT_CUDA_VERSION 10.2)
+set(DEFAULT_CUDNN_VERSION 7.6)
 set(DEFAULT_PROTOBUF_VERSION 3.0.0)
 set(DEFAULT_PROTOBUF_INTERNAL_VERSION 10.0)
 set(DEFAULT_CUB_VERSION 1.8.0)
@@ -107,8 +134,10 @@ endif()
 
 
 find_package(Threads REQUIRED)
-include(third_party/zlib.cmake)
-include(third_party/protobuf.cmake)
+if (BUILD_PLUGINS OR BUILD_PARSERS)
+    include(third_party/zlib.cmake)
+    include(third_party/protobuf.cmake)
+endif()
 if (NVINTERNAL)
 ########################################### DEPENDENCIES FOR BUILDING IN NVIDIA's TREE ############################################
     set(EXTERNALS ${PROJECT_SOURCE_DIR}/../externals)
@@ -159,12 +188,21 @@ else()
 
     include_directories(
         ${CUDA_INCLUDE_DIRS}
+        ${CUDNN_ROOT_DIR}/include
     )
     find_library(CUDNN_LIB cudnn HINTS
         ${CUDA_TOOLKIT_ROOT_DIR} ${CUDNN_ROOT_DIR} PATH_SUFFIXES lib64 lib)
     find_library(CUBLAS_LIB cublas HINTS
         ${CUDA_TOOLKIT_ROOT_DIR} PATH_SUFFIXES lib64 lib lib/stubs)
-
+    # CUBLASLT libraries are only available in CUDA versions > 10. Check for CUDA version here and
+    # remove dependency on the libarary and unset BERT_GENCODES.
+    if (CUDA_VERSION VERSION_LESS_EQUAL 10.0)
+        message(WARNING "Detected CUDA version is <= 10.0! Removing BERT plugins from compilation list.")
+        unset(BERT_GENCODES)
+    else()
+        find_library(CUBLASLT_LIB cublasLt HINTS
+            ${CUDA_TOOLKIT_ROOT_DIR} PATH_SUFFIXES lib64 lib lib/stubs)
+    endif()
     if(BUILD_PARSERS)
         configure_protobuf(${PROTOBUF_VERSION})
     endif()
